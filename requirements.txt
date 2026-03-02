@@ -1,0 +1,10 @@
+# make sure there were installed by the base
+scikit-learn
+pandas
+matplotlib
+statsmodels
+tqdm
+seaborn
+torch
+torchvision
+pytest
