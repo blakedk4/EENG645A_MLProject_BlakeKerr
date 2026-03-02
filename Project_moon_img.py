@@ -80,7 +80,7 @@ def simulate_moon(D1,D2,F,lam,dt,background,si):
     # dt is the integration time in seconds
     # background is the black sky photon level
 
-    path = os.getcwd() + '/EENG645A_MLProject_BlakeKerr/moon_img.txt'#combine directory with image name for full path
+    path = os.getcwd() + '/moon_img.txt'#combine directory with image name for full path /EENG645A_MLProject_BlakeKerr
     opo9914d = np.genfromtxt(path, delimiter=",").astype('float')
     
     #Prealocate 1200 by 1200 image with 3 channels for RGB
