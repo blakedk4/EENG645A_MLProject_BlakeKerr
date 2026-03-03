@@ -62,7 +62,7 @@ valid_positions = np.argwhere(aperture == 0)
 frame=np.zeros([si,si])
 
 #Star and Atmospheric Turbulence Addition/Randomization
-data_samples=10
+data_samples=1000
 all_out_data=[]
 all_filenames=[]
 

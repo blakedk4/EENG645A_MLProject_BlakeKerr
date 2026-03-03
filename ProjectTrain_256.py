@@ -1,4 +1,4 @@
-"""Project ML Algorithm"""
+"""Project ML Algorithm-Blake Kerr"""
 
 import os
 import datetime
@@ -8,10 +8,8 @@ import sklearn.metrics
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
+import cv2  # for image resizing
 
 from utils.utils import (
     init_wandb,
@@ -22,9 +20,6 @@ from utils.utils import (
     set_seed,
 )
 
-########################################################################################
-# Configuration Flags
-########################################################################################
 USE_WANDB = False  # Set to True to enable Weights & Biases logging
 USE_SEED = False  # Set to True to enable reproducibility
 RANDOM_SEED = 42  # Seed value for reproducibility
@@ -34,7 +29,7 @@ USE_TEST = False  # Set to True to visualize test set instead of train set
 # Training configuration
 EPOCHS = 10  # Number of training epochs
 LR = 0.001  # Learning rate
-BATCH_SIZE = 4  # Batch size
+BATCH_SIZE = 8  # Batch size
 
 # File paths
 fig_path = "./figures"
@@ -47,7 +42,7 @@ WANDB_RUN_NAME = f"lab4sol-{run_timestamp}"
 data_dir = "/remote_home/Project_Data"
 os.makedirs(data_dir, exist_ok=True)
 
-def get_dataloaders(data_dir, batch_size=BATCH_SIZE):
+def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(256,256)):
 
     class NPYKeypointDataset(Dataset):
         def __init__(self, data_dir):
@@ -61,9 +56,9 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE):
             base = os.path.basename(filename)
             base = os.path.splitext(base)[0]
             parts = base.split("_")
-            x_act=int(parts[1])
-            y_act=int(parts[3])
-            intensity=int(parts[5])
+            x_act = int(parts[1])
+            y_act = int(parts[3])
+            intensity = int(parts[5])
             return [x_act, y_act]
 
         def __getitem__(self, idx):
@@ -71,16 +66,22 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE):
             path = os.path.join(self.data_dir, file)
 
             image = np.load(path)
-            strn="/remote_home/aperture.npy"
-            aperture = np.load(strn)
-            image=(np.ones(np.shape(aperture))-aperture)*image
+
+            # Convert to float32 before resizing (needed for cv2.resize)
+            image = image.astype(np.float32)
+
+            # Resize image to target_size (H, W)
+            image = cv2.resize(image, target_size)
+
             image = torch.tensor(image, dtype=torch.float32).unsqueeze(0)
             image = image / 255.0
 
             x, y = self.parse_point_from_filename(file)
 
-            #target = torch.tensor([x, y], dtype=torch.float32)
-            target = torch.tensor([x / image.shape[-1], y / image.shape[-2]], dtype=torch.float32)
+            # Normalize coordinates to resized image
+            # Normalize coordinates relative to resized image
+            # Normalize coordinates relative to original image (1024x1024)
+            target = torch.tensor([x / 1024.0, y / 1024.0], dtype=torch.float32)
 
             return image, target
 
@@ -96,9 +97,10 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE):
         full_dataset, [train_size, val_size, test_size]
     )
 
-    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    # Add num_workers and pin_memory for faster GPU transfer
+    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     return trainloader, valloader, testloader
 
@@ -106,23 +108,21 @@ class SingleObjectDetector(nn.Module):
     def __init__(self):
         super(SingleObjectDetector, self).__init__()
         
-        # Convolutional feature extractor
         self.conv_layers = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # 1024 -> 512
+            nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # 512 -> 256
+            nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # 256 -> 128
+            #nn.MaxPool2d(2),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2)   # 128 -> 64
+            nn.MaxPool2d(2)
         )
         
-        # Fully connected layers (after global average pooling)
         self.fc = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
@@ -130,35 +130,35 @@ class SingleObjectDetector(nn.Module):
             nn.ReLU()
         )
         
-        # Output layers
-        self.presence = nn.Linear(64, 1)  # Sigmoid later
-        self.coords = nn.Linear(64, 2)    # x, y coordinates
+        self.presence = nn.Linear(64, 1)
+        self.coords = nn.Linear(64, 2)
 
     def forward(self, x):
-        x = self.conv_layers(x)                       # shape: (B, 128, H, W)
-        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))  # shape: (B, 128, 1, 1)
-        x = x.view(x.size(0), -1)                    # shape: (B, 128)
-        x = self.fc(x)                               # shape: (B, 64)
-        
-        presence = torch.sigmoid(self.presence(x))  # shape: (B, 1)
-        coords = self.coords(x)                     # shape: (B, 2)
+        x = self.conv_layers(x)
+        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        presence = torch.sigmoid(self.presence(x))
+        coords = torch.sigmoid(self.coords(x))  # constrain outputs to [0,1]
         return presence, coords
 
-def evaluate_model(model, dataloader, device, criterion):
+def evaluate_model(model, dataloader, device, criterion, original_size=(1024, 1024)):
     """
     Evaluate a model on a given dataloader for keypoint regression.
 
     Args:
-        model: PyTorch model to evaluate
+        model: PyTorch model
         dataloader: DataLoader containing the evaluation data
         device: Device to run evaluation on (cpu/cuda)
         criterion: Loss function (optional, computes loss if provided)
+        original_size: tuple (height, width) of the original images
 
     Returns:
         dict with keys:
-            - 'predictions': numpy array of predicted coordinates
-            - 'true_labels': numpy array of true coordinates
+            - 'predictions': numpy array of predicted coordinates (normalized)
+            - 'true_labels': numpy array of true coordinates (normalized)
             - 'loss': float, average loss (only if criterion provided)
+            - 'accuracy': float, % of points within threshold pixels
     """
     model.eval()
     y_pred = []
@@ -183,23 +183,25 @@ def evaluate_model(model, dataloader, device, criterion):
     y_pred = np.array(y_pred)
     y_true = np.array(y_true)
 
-    # Compute distances in pixels
-    img_height, img_width = dataloader.dataset[0][0].shape[1:]  # C,H,W
-    y_pred_pixels = y_pred.copy()
-    y_pred_pixels[:, 0] *= img_width
-    y_pred_pixels[:, 1] *= img_height
-    y_true_pixels = y_true.copy()
-    y_true_pixels[:, 0] *= img_width
-    y_true_pixels[:, 1] *= img_height
+    orig_h, orig_w = original_size
 
-    threshold_pixels=10
+    # Scale normalized coordinates to original pixels
+    y_pred_pixels = y_pred.copy()
+    y_pred_pixels[:, 0] *= orig_w
+    y_pred_pixels[:, 1] *= orig_h
+
+    y_true_pixels = y_true.copy()
+    y_true_pixels[:, 0] *= orig_w
+    y_true_pixels[:, 1] *= orig_h
+    # Compute distances in pixels
+    threshold_pixels = 10
     distances = np.linalg.norm(y_pred_pixels - y_true_pixels, axis=1)
     correct_count = np.sum(distances <= threshold_pixels)
     accuracy = correct_count / len(distances) * 100
 
     results = {
-        'predictions': y_pred,
-        'true_labels': y_true,
+        'predictions': y_pred_pixels,   # scaled to original image
+        'true_labels': y_true_pixels,   # scaled to original image
         'accuracy': accuracy,
     }
 
@@ -208,60 +210,24 @@ def evaluate_model(model, dataloader, device, criterion):
 
     return results
 
-
-def train_model(
-    model,
-    trainloader,
-    valloader,
-    criterion,
-    optimizer,
-    device,
-    epochs,
-    use_wandb=False,
-):
-    """
-    Train a keypoint regression model.
-
-    Args:
-        model: PyTorch model
-        trainloader: DataLoader for training set
-        valloader: DataLoader for validation set
-        epochs: number of training epochs
-        lr: learning rate
-        device: device to train on ('cpu' or 'cuda')
-        use_wandb: whether to log metrics to wandb
-
-    Returns:
-        model: trained model
-        history: dict with train/val loss per epoch
-    """
+def train_model(model, trainloader, valloader, criterion, optimizer, device, epochs, use_wandb=False):
     model.to(device)
-
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-    }
+    history = {"train_loss": [], "val_loss": []}
 
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
-        print("Epoch:",epoch)
-
         for images, targets in trainloader:
             images = images.to(device)
             targets = targets.to(device)
-
             optimizer.zero_grad()
             _, coords = model(images)
             loss = criterion(coords, targets)
             loss.backward()
             optimizer.step()
-
             running_loss += loss.item() * images.size(0)
 
         train_loss = running_loss / len(trainloader.dataset)
-
-        # Validation
         val_results = evaluate_model(model, valloader, device, criterion)
         val_loss = val_results['loss']
         val_accuracy = val_results['accuracy']
@@ -270,11 +236,7 @@ def train_model(
         history["val_loss"].append(val_loss)
 
         if use_wandb:
-            log_to_wandb(
-                {"train_loss": train_loss, "val_loss": val_loss},
-                step=epoch,
-                use_wandb=use_wandb
-            )
+            log_to_wandb({"train_loss": train_loss, "val_loss": val_loss}, step=epoch, use_wandb=use_wandb)
 
         print(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
 
@@ -282,7 +244,6 @@ def train_model(
     return model, history
 
 def main():
-    # Set random seed for reproducibility
     if USE_SEED:
         set_seed(RANDOM_SEED)
 
@@ -295,72 +256,39 @@ def main():
         print("WARNING Using CPU (this will be slow!)")
         print("*" * 60)
 
-    # Create directories if they don't exist
     os.makedirs(fig_path, exist_ok=True)
     os.makedirs(model_path, exist_ok=True)
 
-    # Get dataloaders
-    trainloader, valloader, testloader = get_dataloaders(data_dir, batch_size=BATCH_SIZE)
-    print("Data Loaded")
-    # Initialize wandb if enabled
-    config = {
-        "epochs": EPOCHS,
-        "batch_size": BATCH_SIZE,
-        "learning_rate": LR,
-        "seed": RANDOM_SEED if USE_SEED else None,
-    }
-    init_wandb(
-        project_name=WANDB_PROJECT,
-        run_name=WANDB_RUN_NAME,
-        config=config,
-        use_wandb=USE_WANDB,
-    )
+    trainloader, valloader, testloader = get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(512, 512))
+
+    config = {"epochs": EPOCHS, "batch_size": BATCH_SIZE, "learning_rate": LR, "seed": RANDOM_SEED if USE_SEED else None}
+    init_wandb(project_name=WANDB_PROJECT, run_name=WANDB_RUN_NAME, config=config, use_wandb=USE_WANDB)
 
     model_save_path = f"{model_path}/single_object_detector.pth"
-
-    # Initialize or load model
     model = SingleObjectDetector().to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
     if not os.path.exists(model_save_path) or TRAIN_FLAG:
-        # Train the model
-        model, history = train_model(
-            model,
-            trainloader,
-            valloader,
-            criterion,
-            optimizer,
-            device,
-            epochs=EPOCHS,
-            use_wandb=USE_WANDB,
-        )
+        model, history = train_model(model, trainloader, valloader, criterion, optimizer, device, epochs=EPOCHS, use_wandb=USE_WANDB)
         torch.save(model.state_dict(), model_save_path)
     else:
-        # Load existing model
         model.load_state_dict(torch.load(model_save_path))
         model.eval()
 
-    # Choose loader for visualization
     loader = testloader if USE_TEST else trainloader
-
-    # Evaluate on chosen loader
     results = evaluate_model(model, loader, device, criterion)
+    y_pred_pixels = results['predictions']   # Already scaled to 1024x1024
+    y_true_pixels = results['true_labels']   # Already scaled to 1024x1024
+    accuracy = results['accuracy']
 
-    y_pred = results['predictions']
-    y_true = results['true_labels']
-    y_pred_pixels = y_pred.copy()
-    y_pred_pixels[:, 0] *= y_true.shape[1]  # width
-    y_pred_pixels[:, 1] *= y_true.shape[0]  # height
     # Print a few predictions vs true values
     print("\nSample predictions vs true coordinates:")
     for i in range(min(5, len(y_pred_pixels))):
-        print(f"Predicted: {y_pred_pixels[i]}, True: {y_true[i]}")
+        print(f"Predicted: {y_pred_pixels[i]}, True: {y_true_pixels[i]}")
 
-    # Optional: compute pixel errors
-    errors = np.linalg.norm(y_pred_pixels - y_true, axis=1)
-    print(f"\nMean pixel error: {np.mean(errors):.2f}, Max error: {np.max(errors):.2f}, Accuracy: {val_accuracy:.4f}")
-    val_accuracy = val_results['accuracy']
+    errors = np.linalg.norm(y_pred_pixels - y_true_pixels, axis=1)
+    print(f"\nMean pixel error: {np.mean(errors):.2f}, Max error: {np.max(errors):.2f}, Accuracy: {results['accuracy']:.4f}")
 
     finish_wandb(use_wandb=USE_WANDB)
 

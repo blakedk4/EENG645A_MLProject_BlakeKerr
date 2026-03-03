@@ -59,11 +59,11 @@ def err_calc(strn,x,y):
     return err,intensity/6101
 
 threshold = 250
-strn="Project_Data/aperture.npy"
+strn="/remote_home/aperture.npy"
 strn2="Project_Data/x_100_y_100_int_61004.npy"
 aperture = np.load(strn)
 
-folder="Project_Data"
+folder = "/remote_home/Project_Data"
 os.makedirs(folder, exist_ok=True)
 npy_files = glob.glob(os.path.join(folder, "*.npy"))
 npy_files = npy_files[1:]
