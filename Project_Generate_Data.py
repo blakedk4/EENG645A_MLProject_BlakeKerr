@@ -62,7 +62,7 @@ valid_positions = np.argwhere(aperture == 0)
 frame=np.zeros([si,si])
 
 #Star and Atmospheric Turbulence Addition/Randomization
-data_samples=2
+data_samples=10
 all_out_data=[]
 all_filenames=[]
 
@@ -79,7 +79,7 @@ for ii in range(0,data_samples):
 
 print("Saving")
 #plt.show()
-folder = "Project_Data"
+folder = "/remote_home/Project_Data"
 os.makedirs(folder, exist_ok=True)
 
 for img, fname in zip(all_out_data, all_filenames):

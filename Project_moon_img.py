@@ -144,7 +144,7 @@ def simulate_moon(D1,D2,F,lam,dt,background,si):
     moon_outline = make_pupil(3240//2*(si/6000),0,si)
     moon_outline[si//2,si//2]=1
 
-    folder="Project_Data"
+    folder = "/remote_home"
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder,"aperture")
     np.save(filename, moon_outline)
