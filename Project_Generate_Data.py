@@ -70,7 +70,7 @@ all_filenames=[]
 for ii in range(0,data_samples):
     idx = np.random.randint(len(valid_positions))
     y, x = valid_positions[idx]
-    count=np.random.uniform(0,photon_img.max())#10*photon_img.max()#
+    count=np.random.uniform(0,10*photon_img.max())#10*photon_img.max()#
     out_data,filename=star_addition(x,y,count,Img_freq.copy(),otf,B_est,frame.copy())
     
     all_out_data.append(out_data)

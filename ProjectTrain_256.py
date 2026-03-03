@@ -27,8 +27,8 @@ TRAIN_FLAG = True  # Set to True to force retraining the model
 USE_TEST = False  # Set to True to visualize test set instead of train set
 
 # Training configuration
-EPOCHS = 10  # Number of training epochs
-LR = 0.001  # Learning rate
+EPOCHS = 20  # Number of training epochs
+LR = 0.0003  # Learning rate
 BATCH_SIZE = 8  # Batch size
 
 # File paths
@@ -81,7 +81,8 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(256,256)):
             # Normalize coordinates to resized image
             # Normalize coordinates relative to resized image
             # Normalize coordinates relative to original image (1024x1024)
-            target = torch.tensor([x / 1024.0, y / 1024.0], dtype=torch.float32)
+            depth, h ,w= image.shape
+            target = torch.tensor([x / w, y / h], dtype=torch.float32)
 
             return image, target
 
@@ -107,40 +108,43 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(256,256)):
 class SingleObjectDetector(nn.Module):
     def __init__(self):
         super(SingleObjectDetector, self).__init__()
-        
+        # Convolutional layers
         self.conv_layers = nn.Sequential(
+            # 512x512
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(2),              # → 256x256
+
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(2),              # → 128x128
+
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            #nn.MaxPool2d(2),
+            nn.MaxPool2d(2),              # → 64x64
+
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2)
+            nn.MaxPool2d(2)               # → 32x32
         )
-        
+
+        # Fully connected layers
         self.fc = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(128 * 32 * 32, 128),  # 131072 → 128
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU()
         )
-        
-        self.presence = nn.Linear(64, 1)
+        # Output layer (coords only — presence removed)
         self.coords = nn.Linear(64, 2)
 
     def forward(self, x):
         x = self.conv_layers(x)
-        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
-        x = x.view(x.size(0), -1)
+        # Flatten full spatial map
+        x = torch.flatten(x, 1)  # shape: [batch, 131072]
         x = self.fc(x)
-        presence = torch.sigmoid(self.presence(x))
-        coords = torch.sigmoid(self.coords(x))  # constrain outputs to [0,1]
-        return presence, coords
+        coords = self.coords(x)
+        return coords
 
 def evaluate_model(model, dataloader, device, criterion, original_size=(1024, 1024)):
     """
@@ -171,7 +175,7 @@ def evaluate_model(model, dataloader, device, criterion, original_size=(1024, 10
             targets = targets.to(device)
 
             # Forward pass
-            _, coords = model(images)
+            coords = model(images)
 
             # Compute loss if criterion provided
             if criterion is not None:
@@ -221,7 +225,7 @@ def train_model(model, trainloader, valloader, criterion, optimizer, device, epo
             images = images.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
-            _, coords = model(images)
+            coords = model(images)
             loss = criterion(coords, targets)
             loss.backward()
             optimizer.step()
@@ -266,8 +270,12 @@ def main():
 
     model_save_path = f"{model_path}/single_object_detector.pth"
     model = SingleObjectDetector().to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.SmoothL1Loss()
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LR,
+        weight_decay=1e-4
+    )
 
     if not os.path.exists(model_save_path) or TRAIN_FLAG:
         model, history = train_model(model, trainloader, valloader, criterion, optimizer, device, epochs=EPOCHS, use_wandb=USE_WANDB)
