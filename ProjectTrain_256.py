@@ -30,9 +30,9 @@ USE_TEST = False  # Set to True to visualize test set instead of train set
 
 # Training configuration
 EPOCHS = 20  # Number of training epochs
-LR = 0.0003  # Learning rate
+LR = 0.0005  # Learning rate
 BATCH_SIZE = 8  # Batch size
-GRID_SIZE = 8  # number of subdivisions per side (4x4 grid)
+GRID_SIZE = 16  # number of subdivisions per side (N x N grid)
 TARGET_SIZE = 512  # Keep original size
 
 # File paths
@@ -47,10 +47,9 @@ data_dir = "/remote_home/Project_Data"
 os.makedirs(data_dir, exist_ok=True)
 
 
-def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(512,512)):
-
+def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE,TARGET_SIZE)):
     class NPYKeypointDataset(Dataset):
-        def __init__(self, data_dir, target_size=(512,512)):
+        def __init__(self, data_dir, target_size=(TARGET_SIZE,TARGET_SIZE)):
             self.data_dir = data_dir
             self.files = [f for f in os.listdir(data_dir) if f.endswith(".npy")]
             self.target_size = target_size  # store target_size
@@ -145,12 +144,6 @@ class SingleObjectDetector(nn.Module):
         )
 
         # Fully connected layers
-        self.fc = nn.Sequential(
-            nn.Linear(128 * 32 * 32, 128),  # 131072 → 128
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU()
-        )
         # Output layer (coords only — presence removed)
         self.grid_pool = nn.AdaptiveAvgPool2d((GRID_SIZE, GRID_SIZE))
         self.head = nn.Linear(128, 3)  # per cell output stays same
@@ -168,14 +161,14 @@ class SingleObjectDetector(nn.Module):
         x = self.conv_layers(x)
         x = self.grid_pool(x)  # [B, 128, GRID_SIZE, GRID_SIZE]
         B = x.shape[0]
-        x = x.permute(0, 2, 3, 1)        # [B, GRID_SIZE, GRID_SIZE, 128]
-        x = x.reshape(B, GRID_SIZE*GRID_SIZE, 128)
+        x = x.permute(0, 2, 3, 1).reshape(B, GRID_SIZE*GRID_SIZE, 128)
         out = self.head(x)
         presence_logits = out[:, :, 0]
         coords = torch.sigmoid(out[:, :, 1:])
         return coords, presence_logits
 
-def evaluate_model(model, dataloader, device, threshold_pixels=25, original_size=(1024, 1024)):
+def evaluate_model(model, dataloader, device, threshold_pixels=10, original_size=(1024, 1024)):
+    print("Eval Loop")
 
     model.eval()
 
@@ -329,7 +322,7 @@ def main():
         lr=LR,
         weight_decay=1e-4
     )
-
+    print("Begin Training")
     if not os.path.exists(model_save_path) or TRAIN_FLAG:
         model, history = train_model(model, trainloader, valloader, criterion, optimizer, device, epochs=EPOCHS, use_wandb=USE_WANDB)
         torch.save(model.state_dict(), model_save_path)
@@ -340,7 +333,7 @@ def main():
     loader = testloader if USE_TEST else trainloader
     results = evaluate_model(model, loader, device)
 
-    y_pred_pixels = results["pred_pixels"]
+    y_pred_pixels = np.round(results["pred_pixels"])
     y_true_pixels = results["true_pixels"]
     accuracy = results["accuracy"]
 
