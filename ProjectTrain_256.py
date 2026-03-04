@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import cv2  # for image resizing
+from sklearn.metrics import roc_curve, auc
+
 
 from utils.utils import (
     init_wandb,
@@ -30,6 +32,8 @@ USE_TEST = False  # Set to True to visualize test set instead of train set
 EPOCHS = 20  # Number of training epochs
 LR = 0.0003  # Learning rate
 BATCH_SIZE = 8  # Batch size
+GRID_SIZE = 8  # number of subdivisions per side (4x4 grid)
+TARGET_SIZE = 512  # Keep original size
 
 # File paths
 fig_path = "./figures"
@@ -42,12 +46,14 @@ WANDB_RUN_NAME = f"lab4sol-{run_timestamp}"
 data_dir = "/remote_home/Project_Data"
 os.makedirs(data_dir, exist_ok=True)
 
-def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(256,256)):
+
+def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(512,512)):
 
     class NPYKeypointDataset(Dataset):
-        def __init__(self, data_dir):
+        def __init__(self, data_dir, target_size=(512,512)):
             self.data_dir = data_dir
             self.files = [f for f in os.listdir(data_dir) if f.endswith(".npy")]
+            self.target_size = target_size  # store target_size
 
         def __len__(self):
             return len(self.files)
@@ -64,36 +70,46 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(256,256)):
         def __getitem__(self, idx):
             file = self.files[idx]
             path = os.path.join(self.data_dir, file)
+            image = np.load(path).astype(np.float32)
 
-            image = np.load(path)
+            # Resize only if target_size is provided
+            if self.target_size is not None:
+                image = cv2.resize(image, self.target_size)
 
-            # Convert to float32 before resizing (needed for cv2.resize)
-            image = image.astype(np.float32)
-
-            # Resize image to target_size (H, W)
-            image = cv2.resize(image, target_size)
-
-            image = torch.tensor(image, dtype=torch.float32).unsqueeze(0)
-            image = image / 255.0
+            image = torch.tensor(image, dtype=torch.float32).unsqueeze(0) / 255.0
 
             x, y = self.parse_point_from_filename(file)
 
-            # Normalize coordinates to resized image
-            # Normalize coordinates relative to resized image
-            # Normalize coordinates relative to original image (1024x1024)
-            depth, h ,w= image.shape
-            target = torch.tensor([x / w, y / h], dtype=torch.float32)
+            # Normalize to 0-1 global coords
+            x_norm = x / 1024
+            y_norm = y / 1024
 
-            return image, target
+            # --- NEW: Determine which grid cell ---
+            col = int(x_norm * GRID_SIZE)
+            row = int(y_norm * GRID_SIZE)
+            cell_idx = row * GRID_SIZE + col
 
-    full_dataset = NPYKeypointDataset(data_dir)
+            # Local coordinates within the cell
+            x_local = x_norm * GRID_SIZE - col
+            y_local = y_norm * GRID_SIZE - row
+
+            # Create targets
+            coords_target = torch.zeros((GRID_SIZE * GRID_SIZE, 2))
+            presence_target = torch.zeros(GRID_SIZE * GRID_SIZE)
+
+            coords_target[cell_idx] = torch.tensor([x_local, y_local])
+            presence_target[cell_idx] = 1.0
+
+            return image, coords_target, presence_target
+
+    full_dataset = NPYKeypointDataset(data_dir,target_size=(TARGET_SIZE,TARGET_SIZE))
 
     # 70 / 15 / 15 split
     total = len(full_dataset)
     train_size = int(0.7 * total)
     val_size = int(0.15 * total)
     test_size = total - train_size - val_size
-
+    print(f"Total images: {total}, Train: {train_size}, Val: {val_size}, Test: {test_size}")
     train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
         full_dataset, [train_size, val_size, test_size]
     )
@@ -136,113 +152,150 @@ class SingleObjectDetector(nn.Module):
             nn.ReLU()
         )
         # Output layer (coords only — presence removed)
-        self.coords = nn.Linear(64, 2)
+        self.grid_pool = nn.AdaptiveAvgPool2d((GRID_SIZE, GRID_SIZE))
+        self.head = nn.Linear(128, 3)  # per cell output stays same
 
-    def forward(self, x):
+    '''def forward(self, x):
         x = self.conv_layers(x)
         # Flatten full spatial map
         x = torch.flatten(x, 1)  # shape: [batch, 131072]
         x = self.fc(x)
         coords = self.coords(x)
-        return coords
+        presence_logit = self.presence(x)
 
-def evaluate_model(model, dataloader, device, criterion, original_size=(1024, 1024)):
-    """
-    Evaluate a model on a given dataloader for keypoint regression.
+        return coords, presence_logit'''
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.grid_pool(x)  # [B, 128, GRID_SIZE, GRID_SIZE]
+        B = x.shape[0]
+        x = x.permute(0, 2, 3, 1)        # [B, GRID_SIZE, GRID_SIZE, 128]
+        x = x.reshape(B, GRID_SIZE*GRID_SIZE, 128)
+        out = self.head(x)
+        presence_logits = out[:, :, 0]
+        coords = torch.sigmoid(out[:, :, 1:])
+        return coords, presence_logits
 
-    Args:
-        model: PyTorch model
-        dataloader: DataLoader containing the evaluation data
-        device: Device to run evaluation on (cpu/cuda)
-        criterion: Loss function (optional, computes loss if provided)
-        original_size: tuple (height, width) of the original images
+def evaluate_model(model, dataloader, device, threshold_pixels=25, original_size=(1024, 1024)):
 
-    Returns:
-        dict with keys:
-            - 'predictions': numpy array of predicted coordinates (normalized)
-            - 'true_labels': numpy array of true coordinates (normalized)
-            - 'loss': float, average loss (only if criterion provided)
-            - 'accuracy': float, % of points within threshold pixels
-    """
     model.eval()
-    y_pred = []
-    y_true = []
-    total_loss = 0.0
 
-    with torch.no_grad():
-        for images, targets in dataloader:
-            images = images.to(device)
-            targets = targets.to(device)
+    all_probs = []
+    all_labels = []
 
-            # Forward pass
-            coords = model(images)
-
-            # Compute loss if criterion provided
-            if criterion is not None:
-                loss = criterion(coords, targets)
-                total_loss += loss.item() * images.size(0)
-
-            y_pred.extend(coords.cpu().numpy())
-            y_true.extend(targets.cpu().numpy())
-    y_pred = np.array(y_pred)
-    y_true = np.array(y_true)
+    all_pred_pixels = []
+    all_true_pixels = []
 
     orig_h, orig_w = original_size
 
-    # Scale normalized coordinates to original pixels
-    y_pred_pixels = y_pred.copy()
-    y_pred_pixels[:, 0] *= orig_w
-    y_pred_pixels[:, 1] *= orig_h
+    with torch.no_grad():
+        for images, coords_target, presence_target in dataloader:
 
-    y_true_pixels = y_true.copy()
-    y_true_pixels[:, 0] *= orig_w
-    y_true_pixels[:, 1] *= orig_h
-    # Compute distances in pixels
-    threshold_pixels = 10
-    distances = np.linalg.norm(y_pred_pixels - y_true_pixels, axis=1)
-    correct_count = np.sum(distances <= threshold_pixels)
-    accuracy = correct_count / len(distances) * 100
+            images = images.to(device)
+            coords_target = coords_target.to(device)
+            presence_target = presence_target.to(device)
 
-    results = {
-        'predictions': y_pred_pixels,   # scaled to original image
-        'true_labels': y_true_pixels,   # scaled to original image
-        'accuracy': accuracy,
+            coords_pred, presence_logits = model(images)
+
+            probs = torch.sigmoid(presence_logits)
+
+            # --- ROC COLLECTION ---
+            all_probs.extend(probs.cpu().numpy().flatten())
+            all_labels.extend(presence_target.cpu().numpy().flatten())
+
+            # --- NEW: Convert grid predictions back to global coords ---
+            B = images.size(0)
+
+            for b in range(B):
+
+                # True quadrant
+                true_quad = torch.argmax(presence_target[b]).item()
+
+                # Predicted quadrant (highest presence probability)
+                pred_quad = torch.argmax(probs[b]).item()
+
+                # Get local coords
+                pred_local = coords_pred[b, pred_quad]
+                true_local = coords_target[b, true_quad]
+
+                # Convert quadrant index to row/col
+                pred_row = pred_quad // GRID_SIZE
+                pred_col = pred_quad % GRID_SIZE
+                true_row = true_quad // GRID_SIZE
+                true_col = true_quad % GRID_SIZE
+
+                # Convert back to global normalized coords
+                pred_x_global = (pred_local[0] / GRID_SIZE + 1.0 / GRID_SIZE * pred_col)
+                pred_y_global = (pred_local[1] / GRID_SIZE + 1.0 / GRID_SIZE * pred_row)
+                true_x_global = (true_local[0] / GRID_SIZE + 1.0 / GRID_SIZE * true_col)
+                true_y_global = (true_local[1] / GRID_SIZE + 1.0 / GRID_SIZE * true_row)
+
+                # Convert to pixel space
+                pred_x_pixel = pred_x_global.item() * orig_w
+                pred_y_pixel = pred_y_global.item() * orig_h
+
+                true_x_pixel = true_x_global.item() * orig_w
+                true_y_pixel = true_y_global.item() * orig_h
+
+                all_pred_pixels.append([pred_x_pixel, pred_y_pixel])
+                all_true_pixels.append([true_x_pixel, true_y_pixel])
+
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+
+    all_pred_pixels = np.array(all_pred_pixels)
+    all_true_pixels = np.array(all_true_pixels)
+
+    # --- ORIGINAL ACCURACY METRIC (Pixel Distance) ---
+    distances = np.linalg.norm(all_pred_pixels - all_true_pixels, axis=1)
+    correct = np.sum(distances <= threshold_pixels)
+    accuracy = correct / len(distances) * 100
+
+    return {
+        "probs": all_probs,
+        "labels": all_labels,
+        "pred_pixels": all_pred_pixels,
+        "true_pixels": all_true_pixels,
+        "accuracy": accuracy
     }
-
-    if criterion is not None:
-        results['loss'] = total_loss / len(dataloader.dataset)
-
-    return results
 
 def train_model(model, trainloader, valloader, criterion, optimizer, device, epochs, use_wandb=False):
     model.to(device)
     history = {"train_loss": [], "val_loss": []}
-
+    coord_loss_fn = nn.SmoothL1Loss(reduction="none")
+    presence_loss_fn = nn.BCEWithLogitsLoss()
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
-        for images, targets in trainloader:
+        for images, coords_target, presence_target in trainloader:
             images = images.to(device)
-            targets = targets.to(device)
+            coords_target = coords_target.to(device)
+            presence_target = presence_target.to(device)
             optimizer.zero_grad()
-            coords = model(images)
-            loss = criterion(coords, targets)
+            coords_pred,presence_logits = model(images)
+            
+            # --- NEW: Presence loss ---
+            loss_presence = presence_loss_fn(
+                presence_logits, presence_target
+            )
+
+            # --- NEW: Masked coordinate loss ---
+            coord_loss_raw = coord_loss_fn(coords_pred, coords_target)
+            mask = presence_target.unsqueeze(-1)
+            coord_loss = (coord_loss_raw * mask).sum() / mask.sum().clamp(min=1)
+
+            loss = loss_presence+100*coord_loss
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * images.size(0)
 
         train_loss = running_loss / len(trainloader.dataset)
-        val_results = evaluate_model(model, valloader, device, criterion)
-        val_loss = val_results['loss']
-        val_accuracy = val_results['accuracy']
-
         history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
+        val_results = evaluate_model(model, valloader, device)
+        val_accuracy = val_results["accuracy"]
+        #if use_wandb:
+            #log_to_wandb({"train_loss": train_loss, "val_loss": val_loss}, step=epoch, use_wandb=use_wandb)
 
-        if use_wandb:
-            log_to_wandb({"train_loss": train_loss, "val_loss": val_loss}, step=epoch, use_wandb=use_wandb)
-
-        print(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+        print(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Accuracy: {val_accuracy:.4f}")
 
     print("Finished Training")
     return model, history
@@ -263,7 +316,7 @@ def main():
     os.makedirs(fig_path, exist_ok=True)
     os.makedirs(model_path, exist_ok=True)
 
-    trainloader, valloader, testloader = get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(512, 512))
+    trainloader, valloader, testloader = get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE, TARGET_SIZE))
 
     config = {"epochs": EPOCHS, "batch_size": BATCH_SIZE, "learning_rate": LR, "seed": RANDOM_SEED if USE_SEED else None}
     init_wandb(project_name=WANDB_PROJECT, run_name=WANDB_RUN_NAME, config=config, use_wandb=USE_WANDB)
@@ -285,11 +338,17 @@ def main():
         model.eval()
 
     loader = testloader if USE_TEST else trainloader
-    results = evaluate_model(model, loader, device, criterion)
-    y_pred_pixels = results['predictions']   # Already scaled to 1024x1024
-    y_true_pixels = results['true_labels']   # Already scaled to 1024x1024
-    accuracy = results['accuracy']
+    results = evaluate_model(model, loader, device)
 
+    y_pred_pixels = results["pred_pixels"]
+    y_true_pixels = results["true_pixels"]
+    accuracy = results["accuracy"]
+
+    fpr, tpr, _ = roc_curve(results["labels"], results["probs"])
+    roc_auc = auc(fpr, tpr)
+
+    print("Pixel Accuracy:", results["accuracy"])
+    print("ROC AUC:", roc_auc)
     # Print a few predictions vs true values
     print("\nSample predictions vs true coordinates:")
     for i in range(min(5, len(y_pred_pixels))):
