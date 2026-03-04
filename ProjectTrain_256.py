@@ -11,7 +11,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import cv2  # for image resizing
 from sklearn.metrics import roc_curve, auc
-
+import matplotlib.pyplot as plt
 
 from utils.utils import (
     init_wandb,
@@ -30,7 +30,7 @@ USE_TEST = False  # Set to True to visualize test set instead of train set
 
 # Training configuration
 EPOCHS = 20  # Number of training epochs
-LR = 0.0005  # Learning rate
+LR = 0.001  # Learning rate
 BATCH_SIZE = 8  # Batch size
 GRID_SIZE = 16  # number of subdivisions per side (N x N grid)
 TARGET_SIZE = 512  # Keep original size
@@ -192,8 +192,15 @@ def evaluate_model(model, dataloader, device, threshold_pixels=10, original_size
             probs = torch.sigmoid(presence_logits)
 
             # --- ROC COLLECTION ---
-            all_probs.extend(probs.cpu().numpy().flatten())
-            all_labels.extend(presence_target.cpu().numpy().flatten())
+            # Max presence probability per image
+            #image_probs = probs.max(dim=1).values
+
+            # Does this image contain any object?
+            #image_labels = presence_target.max(dim=1).values
+
+            # --- ROC COLLECTION ---
+            all_probs.extend(probs.detach().cpu().numpy().flatten())
+            all_labels.extend(presence_target.detach().cpu().numpy().flatten())
 
             # --- NEW: Convert grid predictions back to global coords ---
             B = images.size(0)
@@ -306,6 +313,7 @@ def main():
         print("WARNING Using CPU (this will be slow!)")
         print("*" * 60)
 
+    fig_path = "./figures"
     os.makedirs(fig_path, exist_ok=True)
     os.makedirs(model_path, exist_ok=True)
 
@@ -351,7 +359,19 @@ def main():
     print(f"\nMean pixel error: {np.mean(errors):.2f}, Max error: {np.max(errors):.2f}, Accuracy: {results['accuracy']:.4f}")
 
     finish_wandb(use_wandb=USE_WANDB)
-
+    plt.figure() 
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})') 
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--') 
+    plt.xlabel('False Positive Rate') 
+    plt.ylabel('True Positive Rate') 
+    plt.title('ROC Curve for Presence Detection') 
+    plt.legend(loc="lower right") 
+    
+    
+    roc_save_path = os.path.join(fig_path, "roc_curve.png")
+    plt.savefig(roc_save_path,dpi=300,bbox_inches="tight")
+    print("Roc Curve Saved")
+    plt.close()
 
 if __name__ == "__main__":
     main()
