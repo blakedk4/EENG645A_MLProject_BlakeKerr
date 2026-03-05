@@ -14,6 +14,7 @@ from math import factorial
 from scipy.special import gamma
 from numpy.linalg import cholesky
 from PIL import Image, ImageSequence
+from sklearn.metrics import roc_curve, auc
 
 def threshtest(threshold,image,aperture):
     moon_mask=(np.ones(np.shape(aperture))-aperture)*image
@@ -71,6 +72,9 @@ print(npy_files)
 err=np.zeros(np.size(npy_files))
 intensity=np.zeros(np.size(npy_files))
 i=0
+scores = []  # confidence values
+labels = []  # 0 or 1 if star present
+bound = 10   # pixel distance threshold to count as "found"
 for file_path in npy_files:
     image=np.load(file_path)
     #image[100,100]=200
@@ -78,10 +82,18 @@ for file_path in npy_files:
     #print(x,y)
     print("\nSample:",i+1)
     err[i],intensity[i] = err_calc(file_path,x,y)
+    #confidence = np.exp(-err[i] / 10)
+    if (x, y) != (-1, -1):
+    #Use detected pixel value as confidence
+        confidence = image[y, x] / 6101.0  # normalize intensity to [0,1]
+    else:
+        confidence = 0.0 
+    labels.append(1 if err[i] < bound else 0)  # 1 = correctly found
+    scores.append(confidence)  # use intensity as confidence
     i=i+1
 print("\nThe Total Error is:",np.round(np.sum(err)))
 print("The Mean Error is:",np.round(np.mean(err)))
-bound=10
+
 correct = np.sum(err < 10)
 total = len(err)
 accuracy = correct / total
@@ -103,7 +115,15 @@ plt.legend()
 plt.xticks(np.arange(0, 1, 0.1))
 plt.show()
 #Reciever Operator Characteristic
+# plot_roc_comparison.py
+# Save to disk
+folder = "./figures"
+os.makedirs(folder, exist_ok=True)
+np.save(os.path.join(folder, "labels.npy"), labels)
+np.save(os.path.join(folder, "scores.npy"), scores)
+np.save(os.path.join(folder, "accuracy.npy"),accuracy)
 
+print("Threshold evaluation results saved!")
 '''
 aperture = np.load(strn)
 aperture = make_pupil(3144//2,0,6000)

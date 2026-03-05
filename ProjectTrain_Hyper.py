@@ -21,19 +21,25 @@ from utils.utils import (
     plot_cm,
     set_seed,
 )
+from tqdm import tqdm
+# Hyperparameter optimization
+import optuna
+from optuna_integration.wandb import WeightsAndBiasesCallback
 
 USE_WANDB = False  # Set to True to enable Weights & Biases logging
 USE_SEED = False  # Set to True to enable reproducibility
 RANDOM_SEED = 42  # Seed value for reproducibility
-TRAIN_FLAG = True  # Set to True to force retraining the model
+TRAIN_FLAG = False  # Set to True to force retraining the model
 USE_TEST = False  # Set to True to visualize test set instead of train set
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Training configuration
 EPOCHS = 20  # Number of training epochs
 LR = 0.001  # Learning rate
-BATCH_SIZE = 8  # Batch size
+BATCH_SIZE = 2  # Batch size
 GRID_SIZE = 16  # number of subdivisions per side (N x N grid)
 TARGET_SIZE = 512  # Keep original size
+COORD_WEIGHT = 100
 
 # File paths
 fig_path = "./figures"
@@ -45,6 +51,8 @@ WANDB_PROJECT = "lab4-cat-classifier"
 WANDB_RUN_NAME = f"lab4sol-{run_timestamp}"
 data_dir = "/remote_home/Project_Data"
 os.makedirs(data_dir, exist_ok=True)
+NUM_SAMPLES = 20
+USE_OPTUNA = False
 
 
 def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE,TARGET_SIZE)):
@@ -108,7 +116,7 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE,TA
     train_size = int(0.7 * total)
     val_size = int(0.15 * total)
     test_size = total - train_size - val_size
-    print(f"Total images: {total}, Train: {train_size}, Val: {val_size}, Test: {test_size}")
+    #print(f"Total images: {total}, Train: {train_size}, Val: {val_size}, Test: {test_size}")
     train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
         full_dataset, [train_size, val_size, test_size]
     )
@@ -167,7 +175,7 @@ class SingleObjectDetector(nn.Module):
         coords = torch.sigmoid(out[:, :, 1:])
         return coords, presence_logits
 
-def evaluate_model(model, dataloader, device, threshold_pixels=10, original_size=(1024, 1024)):
+def evaluate_model(model, dataloader, threshold_pixels=10, original_size=(1024, 1024)):
     print("Eval Loop")
 
     model.eval()
@@ -183,9 +191,9 @@ def evaluate_model(model, dataloader, device, threshold_pixels=10, original_size
     with torch.no_grad():
         for images, coords_target, presence_target in dataloader:
 
-            images = images.to(device)
-            coords_target = coords_target.to(device)
-            presence_target = presence_target.to(device)
+            images = images.to(DEVICE)
+            coords_target = coords_target.to(DEVICE)
+            presence_target = presence_target.to(DEVICE)
 
             coords_pred, presence_logits = model(images)
 
@@ -258,18 +266,19 @@ def evaluate_model(model, dataloader, device, threshold_pixels=10, original_size
         "accuracy": accuracy
     }
 
-def train_model(model, trainloader, valloader, criterion, optimizer, device, epochs, use_wandb=False):
-    model.to(device)
+def train_model(model, trainloader, valloader, criterion, optimizer, epochs, use_wandb=False):
+    model.to(DEVICE)
     history = {"train_loss": [], "val_loss": []}
     coord_loss_fn = nn.SmoothL1Loss(reduction="none")
     presence_loss_fn = nn.BCEWithLogitsLoss()
-    for epoch in range(epochs):
-        model.train()
+    #for epoch in range(epochs):
+    model.train()
+    for epoch in range(0,epochs):
         running_loss = 0.0
         for images, coords_target, presence_target in trainloader:
-            images = images.to(device)
-            coords_target = coords_target.to(device)
-            presence_target = presence_target.to(device)
+            images = images.to(DEVICE)
+            coords_target = coords_target.to(DEVICE)
+            presence_target = presence_target.to(DEVICE)
             optimizer.zero_grad()
             coords_pred,presence_logits = model(images)
             
@@ -283,14 +292,14 @@ def train_model(model, trainloader, valloader, criterion, optimizer, device, epo
             mask = presence_target.unsqueeze(-1)
             coord_loss = (coord_loss_raw * mask).sum() / mask.sum().clamp(min=1)
 
-            loss = loss_presence+100*coord_loss
+            loss = loss_presence+COORD_WEIGHT*coord_loss
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * images.size(0)
 
         train_loss = running_loss / len(trainloader.dataset)
         history["train_loss"].append(train_loss)
-        val_results = evaluate_model(model, valloader, device)
+        val_results = evaluate_model(model, valloader)
         val_accuracy = val_results["accuracy"]
         #if use_wandb:
             #log_to_wandb({"train_loss": train_loss, "val_loss": val_loss}, step=epoch, use_wandb=use_wandb)
@@ -300,18 +309,104 @@ def train_model(model, trainloader, valloader, criterion, optimizer, device, epo
     print("Finished Training")
     return model, history
 
+
+# ============================================================================
+# STRATEGY 1: OPTUNA STANDALONE SEARCH
+# ============================================================================
+def optuna_objective(trial):
+
+    # Hyperparameters to search
+    lr=LR
+    #lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
+    coord_weight = trial.suggest_categorical("coord_weight", [10,25,50,100,200,400])
+    grid_size = trial.suggest_categorical("grid_size", [8, 16, 32])
+    target_size = trial.suggest_categorical("target_size",[256, 384, 512])
+    # Load data
+    trainloader, valloader, _ = get_dataloaders(
+        data_dir,
+        batch_size=batch_size,
+        target_size=(TARGET_SIZE, TARGET_SIZE)
+    )
+
+    model = SingleObjectDetector().to(DEVICE)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-4
+    )
+
+    coord_loss_fn = nn.SmoothL1Loss(reduction="none")
+    presence_loss_fn = nn.BCEWithLogitsLoss()
+
+    # Training loop
+    for epoch in range(EPOCHS):
+
+        model.train()
+
+        for images, coords_target, presence_target in trainloader:
+
+            images = images.to(DEVICE)
+            coords_target = coords_target.to(DEVICE)
+            presence_target = presence_target.to(DEVICE)
+
+            optimizer.zero_grad()
+
+            coords_pred, presence_logits = model(images)
+
+            loss_presence = presence_loss_fn(
+                presence_logits,
+                presence_target
+            )
+
+            coord_loss_raw = coord_loss_fn(coords_pred, coords_target)
+            mask = presence_target.unsqueeze(-1)
+
+            coord_loss = (coord_loss_raw * mask).sum() / mask.sum().clamp(min=1)
+
+            loss = loss_presence + coord_weight * coord_loss
+
+            loss.backward()
+            optimizer.step()
+
+    # Evaluate
+    results = evaluate_model(model, valloader)
+
+    return results["accuracy"]
+
+def run_optuna_search(n_trials=NUM_SAMPLES):
+
+    print("\n" + "=" * 60)
+    print("OPTUNA SEARCH")
+    print("=" * 60)
+
+    study = optuna.create_study(
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=2,
+            n_warmup_steps=3
+        )
+    )
+
+    study.optimize(optuna_objective, n_trials=n_trials)
+
+    print("\nBest accuracy:", study.best_trial.value)
+    print("Best hyperparameters:")
+
+    for k, v in study.best_trial.params.items():
+        print(f"{k}: {v}")
+
+    return study
+
 def main():
     if USE_SEED:
         set_seed(RANDOM_SEED)
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print("Device: ", device)
-    if "cuda" in str(device):
+    print("DEVICE: ", DEVICE)
+    if "cuda" in str(DEVICE):
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
-        print("*" * 60)
         print("WARNING Using CPU (this will be slow!)")
-        print("*" * 60)
 
     fig_path = "./figures"
     os.makedirs(fig_path, exist_ok=True)
@@ -323,7 +418,7 @@ def main():
     init_wandb(project_name=WANDB_PROJECT, run_name=WANDB_RUN_NAME, config=config, use_wandb=USE_WANDB)
 
     model_save_path = f"{model_path}/single_object_detector.pth"
-    model = SingleObjectDetector().to(device)
+    model = SingleObjectDetector().to(DEVICE)
     criterion = nn.SmoothL1Loss()
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -331,47 +426,85 @@ def main():
         weight_decay=1e-4
     )
     print("Begin Training")
-    if not os.path.exists(model_save_path) or TRAIN_FLAG:
-        model, history = train_model(model, trainloader, valloader, criterion, optimizer, device, epochs=EPOCHS, use_wandb=USE_WANDB)
-        torch.save(model.state_dict(), model_save_path)
+    if USE_OPTUNA:
+
+        study = run_optuna_search(NUM_SAMPLES)
+
+        print("\nBest trial:")
+        print(f"Accuracy: {study.best_trial.value:.2f}")
+        print("Params:", study.best_trial.params)
+
     else:
-        model.load_state_dict(torch.load(model_save_path))
-        model.eval()
+        if not os.path.exists(model_save_path) or TRAIN_FLAG:
+            model, history = train_model(model, trainloader, valloader, criterion, optimizer, epochs=EPOCHS, use_wandb=USE_WANDB)
+            torch.save(model.state_dict(), model_save_path)
+        else:
+            model.load_state_dict(torch.load(model_save_path))
+            model.eval()
+        
+        loader = testloader if USE_TEST else trainloader
+        results = evaluate_model(model, loader)
 
-    loader = testloader if USE_TEST else trainloader
-    results = evaluate_model(model, loader, device)
+        y_pred_pixels = np.round(results["pred_pixels"])
+        y_true_pixels = results["true_pixels"]
+        accuracy = results["accuracy"]
 
-    y_pred_pixels = np.round(results["pred_pixels"])
-    y_true_pixels = results["true_pixels"]
-    accuracy = results["accuracy"]
+        fpr_cnn, tpr_cnn, _ = roc_curve(results["labels"], results["probs"])
+        roc_auc = auc(fpr_cnn, tpr_cnn)
 
-    fpr, tpr, _ = roc_curve(results["labels"], results["probs"])
-    roc_auc = auc(fpr, tpr)
+        print("Pixel Accuracy:", results["accuracy"])
+        #print("ROC AUC:", roc_auc)
+        # Print a few predictions vs true values
+        print("\nSample predictions vs true coordinates:")
+        for i in range(min(5, len(y_pred_pixels))):
+            print(f"Predicted: {y_pred_pixels[i]}, True: {y_true_pixels[i]}")
 
-    print("Pixel Accuracy:", results["accuracy"])
-    print("ROC AUC:", roc_auc)
-    # Print a few predictions vs true values
-    print("\nSample predictions vs true coordinates:")
-    for i in range(min(5, len(y_pred_pixels))):
-        print(f"Predicted: {y_pred_pixels[i]}, True: {y_true_pixels[i]}")
+        errors = np.linalg.norm(y_pred_pixels - y_true_pixels, axis=1)
+        print(f"\nMean pixel error: {np.mean(errors):.2f}, Max error: {np.max(errors):.2f}, Accuracy: {results['accuracy']:.4f}")
 
-    errors = np.linalg.norm(y_pred_pixels - y_true_pixels, axis=1)
-    print(f"\nMean pixel error: {np.mean(errors):.2f}, Max error: {np.max(errors):.2f}, Accuracy: {results['accuracy']:.4f}")
+        finish_wandb(use_wandb=USE_WANDB)
+        '''
+        plt.figure() 
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})') 
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--') 
+        plt.xlabel('False Positive Rate') 
+        plt.ylabel('True Positive Rate') 
+        plt.title('ROC Curve for Presence Detection') 
+        plt.legend(loc="lower right") 
+        
+        
+        roc_save_path = os.path.join(fig_path, "roc_curve.png")
+        plt.savefig(roc_save_path,dpi=300,bbox_inches="tight")
+        print("Roc Curve Saved")
+        plt.close()
+        plt.figure(figsize=(7,6))'''
+        labels_thresh = np.load("./figures/labels.npy")
+        scores_thresh = np.load("./figures/scores.npy")
+        #scores_norm = scores_thresh / 6101.0
+        #scores_norm = np.clip(scores_norm, 0, 1)  # ensure within [0,1]
+        accuracy_thresh = np.load("./figures/accuracy.npy")
+        print("Pixel Accuracy:", results["accuracy"])
+        print("Threshold Accuracy:", accuracy_thresh*100)
+        fpr_thresh, tpr_thresh, _ = roc_curve(labels_thresh, scores_thresh)
+        roc_auc_thresh = auc(fpr_thresh, tpr_thresh)
+        print("ROC AUC CNN:", roc_auc)
+        print("ROC  THRESH:", roc_auc_thresh)
+        plt.plot(fpr_cnn, tpr_cnn, color='green', lw=2, label=f'CNN Detector (AUC={roc_auc:.2f})')
+        plt.plot(fpr_thresh, tpr_thresh, color='orange', lw=2, label=f'Threshold Detector (AUC={roc_auc_thresh:.2f})')
+        plt.plot([0,1], [0,1], color='navy', lw=2, linestyle='--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Comparison: CNN vs Threshold Detector')
+        plt.legend(loc="lower right")
+        plt.grid(alpha=0.3)
+        plt.show()
 
-    finish_wandb(use_wandb=USE_WANDB)
-    plt.figure() 
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})') 
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--') 
-    plt.xlabel('False Positive Rate') 
-    plt.ylabel('True Positive Rate') 
-    plt.title('ROC Curve for Presence Detection') 
-    plt.legend(loc="lower right") 
-    
-    
-    roc_save_path = os.path.join(fig_path, "roc_curve.png")
-    plt.savefig(roc_save_path,dpi=300,bbox_inches="tight")
-    print("Roc Curve Saved")
-    plt.close()
+        fig_path = "./figures"
+        roc_save_path = os.path.join(fig_path, "roc_curve_Both.png")
+        plt.savefig(roc_save_path,dpi=300,bbox_inches="tight")
+        print("Roc Curve Saved")
+        plt.close()
+
 
 if __name__ == "__main__":
     main()
