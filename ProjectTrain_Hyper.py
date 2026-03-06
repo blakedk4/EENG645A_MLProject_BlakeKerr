@@ -4,33 +4,25 @@ import os
 import datetime
 
 import numpy as np
-import sklearn.metrics
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import cv2  # for image resizing
 from sklearn.metrics import roc_curve, auc
 import matplotlib.pyplot as plt
 
-from utils.utils import (
-    init_wandb,
-    log_to_wandb,
-    log_image_to_wandb,
-    finish_wandb,
-    plot_cm,
-    set_seed,
-)
-from tqdm import tqdm
 # Hyperparameter optimization
 import optuna
-from optuna_integration.wandb import WeightsAndBiasesCallback
+from utils.utils import set_seed
+from torch.utils.tensorboard import SummaryWriter
 
-USE_WANDB = False  # Set to True to enable Weights & Biases logging
+
 USE_SEED = False  # Set to True to enable reproducibility
 RANDOM_SEED = 42  # Seed value for reproducibility
-TRAIN_FLAG = False  # Set to True to force retraining the model
+TRAIN_FLAG = True  # Set to True to force retraining the model
 USE_TEST = False  # Set to True to visualize test set instead of train set
+NUM_SAMPLES = 30
+USE_OPTUNA = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Training configuration
@@ -41,18 +33,15 @@ GRID_SIZE = 16  # number of subdivisions per side (N x N grid)
 TARGET_SIZE = 512  # Keep original size
 COORD_WEIGHT = 100
 
+coord_loss_fn = nn.SmoothL1Loss(reduction="none")
+presence_loss_fn = nn.BCEWithLogitsLoss()
 # File paths
 fig_path = "./figures"
 model_path = "./models"
 run_timestamp = datetime.datetime.now().strftime("%m%d-%H%M")
-
-# WANDB configuration
-WANDB_PROJECT = "lab4-cat-classifier"
-WANDB_RUN_NAME = f"lab4sol-{run_timestamp}"
+writer = SummaryWriter(log_dir=f"runs/cnn_detector_{run_timestamp}")
 data_dir = "/remote_home/Project_Data"
 os.makedirs(data_dir, exist_ok=True)
-NUM_SAMPLES = 20
-USE_OPTUNA = False
 
 
 def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE,TARGET_SIZE)):
@@ -91,7 +80,7 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE,TA
             x_norm = x / 1024
             y_norm = y / 1024
 
-            # --- NEW: Determine which grid cell ---
+            # Determine which grid cell
             col = int(x_norm * GRID_SIZE)
             row = int(y_norm * GRID_SIZE)
             cell_idx = row * GRID_SIZE + col
@@ -120,8 +109,6 @@ def get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE,TA
     train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
         full_dataset, [train_size, val_size, test_size]
     )
-
-    # Add num_workers and pin_memory for faster GPU transfer
     trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -150,24 +137,13 @@ class SingleObjectDetector(nn.Module):
             nn.ReLU(),
             nn.MaxPool2d(2)               # → 32x32
         )
-
-        # Fully connected layers
-        # Output layer (coords only — presence removed)
+        # Output layer
         self.grid_pool = nn.AdaptiveAvgPool2d((GRID_SIZE, GRID_SIZE))
-        self.head = nn.Linear(128, 3)  # per cell output stays same
+        self.head = nn.Linear(128, 3) 
 
-    '''def forward(self, x):
-        x = self.conv_layers(x)
-        # Flatten full spatial map
-        x = torch.flatten(x, 1)  # shape: [batch, 131072]
-        x = self.fc(x)
-        coords = self.coords(x)
-        presence_logit = self.presence(x)
-
-        return coords, presence_logit'''
     def forward(self, x):
         x = self.conv_layers(x)
-        x = self.grid_pool(x)  # [B, 128, GRID_SIZE, GRID_SIZE]
+        x = self.grid_pool(x)
         B = x.shape[0]
         x = x.permute(0, 2, 3, 1).reshape(B, GRID_SIZE*GRID_SIZE, 128)
         out = self.head(x)
@@ -198,13 +174,6 @@ def evaluate_model(model, dataloader, threshold_pixels=10, original_size=(1024, 
             coords_pred, presence_logits = model(images)
 
             probs = torch.sigmoid(presence_logits)
-
-            # --- ROC COLLECTION ---
-            # Max presence probability per image
-            #image_probs = probs.max(dim=1).values
-
-            # Does this image contain any object?
-            #image_labels = presence_target.max(dim=1).values
 
             # --- ROC COLLECTION ---
             all_probs.extend(probs.detach().cpu().numpy().flatten())
@@ -253,7 +222,6 @@ def evaluate_model(model, dataloader, threshold_pixels=10, original_size=(1024, 
     all_pred_pixels = np.array(all_pred_pixels)
     all_true_pixels = np.array(all_true_pixels)
 
-    # --- ORIGINAL ACCURACY METRIC (Pixel Distance) ---
     distances = np.linalg.norm(all_pred_pixels - all_true_pixels, axis=1)
     correct = np.sum(distances <= threshold_pixels)
     accuracy = correct / len(distances) * 100
@@ -266,28 +234,22 @@ def evaluate_model(model, dataloader, threshold_pixels=10, original_size=(1024, 
         "accuracy": accuracy
     }
 
-def train_model(model, trainloader, valloader, criterion, optimizer, epochs, use_wandb=False):
+def train_model(model, trainloader, valloader, optimizer, epochs):
     model.to(DEVICE)
     history = {"train_loss": [], "val_loss": []}
-    coord_loss_fn = nn.SmoothL1Loss(reduction="none")
-    presence_loss_fn = nn.BCEWithLogitsLoss()
-    #for epoch in range(epochs):
     model.train()
-    for epoch in range(0,epochs):
+    for epoch in range(epochs):
         running_loss = 0.0
         for images, coords_target, presence_target in trainloader:
             images = images.to(DEVICE)
             coords_target = coords_target.to(DEVICE)
             presence_target = presence_target.to(DEVICE)
             optimizer.zero_grad()
+
             coords_pred,presence_logits = model(images)
-            
-            # --- NEW: Presence loss ---
             loss_presence = presence_loss_fn(
                 presence_logits, presence_target
             )
-
-            # --- NEW: Masked coordinate loss ---
             coord_loss_raw = coord_loss_fn(coords_pred, coords_target)
             mask = presence_target.unsqueeze(-1)
             coord_loss = (coord_loss_raw * mask).sum() / mask.sum().clamp(min=1)
@@ -301,9 +263,9 @@ def train_model(model, trainloader, valloader, criterion, optimizer, epochs, use
         history["train_loss"].append(train_loss)
         val_results = evaluate_model(model, valloader)
         val_accuracy = val_results["accuracy"]
-        #if use_wandb:
-            #log_to_wandb({"train_loss": train_loss, "val_loss": val_loss}, step=epoch, use_wandb=use_wandb)
-
+        if not USE_OPTUNA:
+            writer.add_scalar("Train/Loss", train_loss, epoch)
+            writer.add_scalar("Validation/Accuracy", val_accuracy, epoch)
         print(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Accuracy: {val_accuracy:.4f}")
 
     print("Finished Training")
@@ -316,12 +278,19 @@ def train_model(model, trainloader, valloader, criterion, optimizer, epochs, use
 def optuna_objective(trial):
 
     # Hyperparameters to search
-    lr=LR
-    #lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    #lr=LR
+    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
     batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
-    coord_weight = trial.suggest_categorical("coord_weight", [10,25,50,100,200,400])
+    coord_weight = trial.suggest_categorical("coord_weight", [10,25,50,100,200])
     grid_size = trial.suggest_categorical("grid_size", [8, 16, 32])
     target_size = trial.suggest_categorical("target_size",[256, 384, 512])
+    global GRID_SIZE
+    global TARGET_SIZE
+    global COORD_WEIGHT
+
+    GRID_SIZE = grid_size
+    TARGET_SIZE = target_size
+    COORD_WEIGHT = coord_weight
     # Load data
     trainloader, valloader, _ = get_dataloaders(
         data_dir,
@@ -336,9 +305,6 @@ def optuna_objective(trial):
         lr=lr,
         weight_decay=1e-4
     )
-
-    coord_loss_fn = nn.SmoothL1Loss(reduction="none")
-    presence_loss_fn = nn.BCEWithLogitsLoss()
 
     # Training loop
     for epoch in range(EPOCHS):
@@ -380,15 +346,19 @@ def run_optuna_search(n_trials=NUM_SAMPLES):
     print("\n" + "=" * 60)
     print("OPTUNA SEARCH")
     print("=" * 60)
-
+    db_path = "optuna_study.db"
+    if os.path.exists(db_path):
+        os.remove(db_path)
     study = optuna.create_study(
         direction="maximize",
+        storage="sqlite:///optuna_study.db",
+        study_name="cnn_detector",
+        load_if_exists=False,
         pruner=optuna.pruners.MedianPruner(
             n_startup_trials=2,
             n_warmup_steps=3
         )
     )
-
     study.optimize(optuna_objective, n_trials=n_trials)
 
     print("\nBest accuracy:", study.best_trial.value)
@@ -408,18 +378,13 @@ def main():
     else:
         print("WARNING Using CPU (this will be slow!)")
 
-    fig_path = "./figures"
-    os.makedirs(fig_path, exist_ok=True)
-    os.makedirs(model_path, exist_ok=True)
-
     trainloader, valloader, testloader = get_dataloaders(data_dir, batch_size=BATCH_SIZE, target_size=(TARGET_SIZE, TARGET_SIZE))
 
     config = {"epochs": EPOCHS, "batch_size": BATCH_SIZE, "learning_rate": LR, "seed": RANDOM_SEED if USE_SEED else None}
-    init_wandb(project_name=WANDB_PROJECT, run_name=WANDB_RUN_NAME, config=config, use_wandb=USE_WANDB)
 
     model_save_path = f"{model_path}/single_object_detector.pth"
     model = SingleObjectDetector().to(DEVICE)
-    criterion = nn.SmoothL1Loss()
+    #criterion = nn.SmoothL1Loss()
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LR,
@@ -436,7 +401,7 @@ def main():
 
     else:
         if not os.path.exists(model_save_path) or TRAIN_FLAG:
-            model, history = train_model(model, trainloader, valloader, criterion, optimizer, epochs=EPOCHS, use_wandb=USE_WANDB)
+            model, history = train_model(model, trainloader, valloader, optimizer, epochs=EPOCHS)
             torch.save(model.state_dict(), model_save_path)
         else:
             model.load_state_dict(torch.load(model_save_path))
@@ -462,22 +427,6 @@ def main():
         errors = np.linalg.norm(y_pred_pixels - y_true_pixels, axis=1)
         print(f"\nMean pixel error: {np.mean(errors):.2f}, Max error: {np.max(errors):.2f}, Accuracy: {results['accuracy']:.4f}")
 
-        finish_wandb(use_wandb=USE_WANDB)
-        '''
-        plt.figure() 
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})') 
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--') 
-        plt.xlabel('False Positive Rate') 
-        plt.ylabel('True Positive Rate') 
-        plt.title('ROC Curve for Presence Detection') 
-        plt.legend(loc="lower right") 
-        
-        
-        roc_save_path = os.path.join(fig_path, "roc_curve.png")
-        plt.savefig(roc_save_path,dpi=300,bbox_inches="tight")
-        print("Roc Curve Saved")
-        plt.close()
-        plt.figure(figsize=(7,6))'''
         labels_thresh = np.load("./figures/labels.npy")
         scores_thresh = np.load("./figures/scores.npy")
         #scores_norm = scores_thresh / 6101.0
@@ -504,7 +453,9 @@ def main():
         plt.savefig(roc_save_path,dpi=300,bbox_inches="tight")
         print("Roc Curve Saved")
         plt.close()
-
-
+        writer.add_scalar("Final/pixel_accuracy", accuracy)
+        writer.add_scalar("Final/mean_pixel_error", np.mean(errors))
+        writer.add_scalar("Final/roc_auc", roc_auc)
+    writer.close()
 if __name__ == "__main__":
     main()
