@@ -21,3 +21,5 @@ Number of trials in the hyperparameter search
 EPOCHS
 Number of EPOCHS, used in both the hyperparameter search and the normal train algorithm.
 Note that below 20 epochs the model may not be able to reduce coordinate loss to a point where it can increase the accuracy, resulting in super low accuracy results.
+
+All other files were for the baseline threshold test, are called in the data generation process, store output files/figures, or were for reference purposes when writing the algorithm.
